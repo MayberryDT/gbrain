@@ -27,7 +27,6 @@
 
 import { createHash } from 'crypto';
 import type { BrainEngine } from '../core/engine.ts';
-import { buildToolDefs } from './tool-defs.ts';
 import { resolveMcpInstructions } from './instructions.ts';
 import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
 import { operations } from '../core/operations.ts';
@@ -36,6 +35,8 @@ import { VERSION } from '../version.ts';
 import { dispatchToolCall, requestLogStatusForResult } from './dispatch.ts';
 import { parseStrictParamsMode } from './validate-params.ts';
 import { filterOpsForSurface, clampSurface, type McpSurface } from './surface.ts';
+import { resolvePresentation, projectAdvertisedTools, compactAdvertisedNames, callerMayUseOperation } from './presentation.ts';
+import { planCompactCall, buildExecutePolicy, facadeError } from './execute-tool.ts';
 import { disabledOpsForPublishGates } from './publish-gates.ts';
 import { loadConfig } from '../core/config.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
@@ -206,7 +207,6 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
   // enforcement still resolves per call.
   const fileConfig = loadConfig();
   const strictParams = parseStrictParamsMode(fileConfig?.mcp?.strict_params) === 'reject';
-  const tools = buildToolDefs(surfacedOps, { strictParams });
 
   /**
    * v0.41.3 (T6): single consolidated CORS header builder. Pre-fix there were
@@ -428,18 +428,25 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         // actually call it (OV2-14; a verbs/starter-pinned serve must not
         // order agents to call a tool dispatch will deny).
         const writeback = await resolveWritebackConfig(engine, fileConfig);
+        const presentation = (await resolvePresentation({
+          engine,
+          config: fileConfig,
+          clientId: auth.auth?.clientId,
+        })).value;
         return Response.json(
           {
             result: {
               protocolVersion: '2025-03-26',
               serverInfo: { name: 'gbrain', version: VERSION },
               capabilities: { tools: {} },
-              // #4748: contract (+ opt-in writeback section) + deployment identity.
               instructions: resolveMcpInstructions(fileConfig, process.env, {
                 writeback: ambientOptsFrom(writeback, {
                   remember: surfaceAllowedOps ? surfaceAllowedOps.has('remember') : true,
-                  extractFacts: surfaceAllowedOps ? surfaceAllowedOps.has('extract_facts') : true,
+                  extractFacts: presentation === 'compact'
+                    ? false
+                    : (surfaceAllowedOps ? surfaceAllowedOps.has('extract_facts') : true),
                 }),
+                presentation,
               }),
             },
             jsonrpc: '2.0',
@@ -467,9 +474,13 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         // unconditionally, so gates-off served the exact listed-but-denied
         // catalog lie E5 (test/truthful-catalog.e2e-lite.test.ts) pins out.
         const gateDisabled = await disabledOpsForPublishGates(engine, fileConfig);
-        const visibleTools = gateDisabled.size === 0
-          ? tools
-          : tools.filter(t => !gateDisabled.has(t.name));
+        const presentation = (await resolvePresentation({
+          engine,
+          config: fileConfig,
+          clientId: auth.auth?.clientId,
+        })).value;
+        const visibleOps = surfacedOps.filter(op => !gateDisabled.has(op.name));
+        const visibleTools = projectAdvertisedTools(visibleOps, { presentation, surface, strictParams });
         logRequest(auth.tokenName!, 'tools/list', 'success', Date.now() - startedMs);
         return Response.json(
           { result: { tools: visibleTools }, jsonrpc: '2.0', id },
@@ -477,17 +488,54 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         );
       }
 
-      // tools/call — dispatch through shared dispatch.ts (parity with stdio)
       if (method === 'tools/call') {
-        const toolName: string = params?.name ?? 'unknown';
-        const args: Record<string, unknown> = params?.arguments ?? {};
-        // v0.28: thread per-token takes-holder allow-list so takes_list /
-        // takes_search / query (when it returns takes) can server-side filter.
-        // v0.34.1 (#861): thread source-isolation scope. Legacy access_tokens
-        // path defaults to 'default' per AuthResult.sourceId above.
-        // #3242: a token with NO operator-set source grant reads across the
-        // federated set (config.federated sources), not just the scalar
-        // 'default' floor. Granted tokens (hasSourceGrant) never widen.
+        let toolName: string = params?.name ?? 'unknown';
+        let args: Record<string, unknown> = params?.arguments ?? {};
+        const presentation = (await resolvePresentation({
+          engine,
+          config: fileConfig,
+          clientId: auth.auth?.clientId,
+        })).value;
+        if (presentation === 'compact') {
+          const gateDisabled = await disabledOpsForPublishGates(engine, fileConfig);
+          const eligible = (op: (typeof surfacedOps)[number]) => callerMayUseOperation(op, {
+            scopes: auth.auth?.scopes?.length ? auth.auth.scopes : null,
+            auth: auth.auth,
+            gateDisabled,
+            transport: 'http',
+            remote: true,
+          });
+          const policy = buildExecutePolicy({
+            operations: surfacedOps,
+            surface,
+            ceiling: surface,
+            eligible,
+            canSelfPersist: false,
+            strictParams,
+          });
+          const advertised = new Set(compactAdvertisedNames({
+            surface,
+            eligibleOps: surfacedOps.filter(eligible),
+          }));
+          const plan = planCompactCall({
+            presentation,
+            requestedName: toolName,
+            requestedParams: args,
+            advertised,
+            policy,
+          });
+          if (plan.action === 'result') {
+            return Response.json({ result: plan.result, jsonrpc: '2.0', id }, { headers: corsHeaders(origin) });
+          }
+          if (plan.action === 'deny') {
+            const denied = facadeError('operation_unavailable', 'That operation is not available.');
+            return Response.json({ result: denied, jsonrpc: '2.0', id }, { headers: corsHeaders(origin) });
+          }
+          if (plan.action === 'forward') {
+            toolName = plan.name;
+            args = plan.params;
+          }
+        }
         let localFederated: string[] | undefined;
         if (auth.hasSourceGrant === false && auth.sourceId) {
           try {
@@ -497,21 +545,16 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         }
         const result = await dispatchToolCall(engine, toolName, args, {
           remote: true,
-          // WP1/D7: network transport — the dispatch-layer localOnly
-          // backstop keys off this marker.
           transport: 'http',
           takesHoldersAllowList: auth.takesHoldersAllowList,
           sourceId: auth.sourceId,
           ...(localFederated ? { localFederatedSourceIds: localFederated } : {}),
-          // #1336: thread the token's federated_read grant so read ops scope
-          // to the operator-granted sources via sourceScopeOpts.
           auth: auth.auth,
-          // MEMORY_VERBS v1 [c1/c2]: fail-closed surface enforcement here too.
           ...(surfaceAllowedOps ? { allowedOps: surfaceAllowedOps } : {}),
           surface,
-          // WP4 (D2): this transport has no per-client rows, so its surface
-          // IS the ceiling request_tools bounds catalog + persist by.
           surfaceCeiling: surface,
+          presentation,
+          surfaceEffective: surface,
         });
         // Same status taxonomy as the OAuth transport (denied_after_list /
         // success_with_warnings feed the amendment-33 metric + E4 usage).

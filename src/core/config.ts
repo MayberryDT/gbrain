@@ -557,6 +557,13 @@ export interface GBrainConfig {
      * over this file slot. Always bounded by the server ceiling (D2).
      */
     default_surface_dcr?: 'verbs' | 'starter' | 'full';
+    /**
+     * Compact presentation default. Unset means legacy. Not a surface and
+     * not an oauth_clients column. Client overrides live in
+     * mcp.presentation_clients as a JSON object of verified client ids.
+     */
+    presentation?: 'legacy' | 'compact';
+    presentation_clients?: Record<string, 'legacy' | 'compact'>;
   };
 }
 
@@ -1497,6 +1504,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // WP3 — unknown tool-call argument posture ('warn' default | 'reject').
   // Read dual-plane by src/mcp/validate-params.ts (DB > file > 'warn').
   'mcp.strict_params',
+  'mcp.presentation',
+  'mcp.presentation_clients',
+  'mcp.default_surface_dcr',
   // Skill-nag suppression (#2180): brain-resident pack install nag off-switch.
   'skillpack.nag_disabled',
   // Self-upgrade (v0.42; file plane, read on the hot path)
