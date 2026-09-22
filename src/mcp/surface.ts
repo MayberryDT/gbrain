@@ -237,15 +237,43 @@ export async function resolveDefaultClientSurface(
   engine: BrainEngine,
   config: GBrainConfig | null | undefined,
 ): Promise<McpSurface | null> {
+  const resolved = await resolveDefaultClientSurfaceDetailed(engine, config);
+  return resolved.value;
+}
+
+export interface SurfaceDefaultResolution {
+  status: 'valid' | 'unset' | 'invalid' | 'unavailable';
+  value: McpSurface | null;
+  provenance: 'db' | 'file' | 'none';
+}
+
+/**
+ * Same dual-plane read as resolveDefaultClientSurface, but invalid and
+ * unavailable are not reported as unset. A non-null invalid DB value consults
+ * the file plane instead of returning null immediately.
+ */
+export async function resolveDefaultClientSurfaceDetailed(
+  engine: BrainEngine,
+  config: GBrainConfig | null | undefined,
+): Promise<SurfaceDefaultResolution> {
+  const fileRaw = (config?.mcp as Record<string, unknown> | undefined)?.default_surface_dcr;
+  const fileSurface = isMcpSurface(fileRaw) ? fileRaw : null;
+  const fileInvalid = fileRaw != null && fileRaw !== '' && !isMcpSurface(fileRaw);
+  let dbVal: unknown;
   try {
-    const dbVal = await engine.getConfig('mcp.default_surface_dcr');
-    if (isMcpSurface(dbVal)) return dbVal;
-    if (dbVal != null) return null; // set but unrecognized → ignore (open value space)
+    dbVal = await engine.getConfig('mcp.default_surface_dcr');
   } catch {
-    // Engine without a config table / transient error → file plane decides.
+    if (fileSurface) return { status: 'unavailable', value: fileSurface, provenance: 'file' };
+    return { status: 'unavailable', value: null, provenance: 'none' };
   }
-  const fileVal = (config?.mcp as Record<string, unknown> | undefined)?.default_surface_dcr;
-  return isMcpSurface(fileVal) ? fileVal : null;
+  if (isMcpSurface(dbVal)) return { status: 'valid', value: dbVal, provenance: 'db' };
+  if (dbVal != null && dbVal !== '') {
+    if (fileSurface) return { status: 'invalid', value: fileSurface, provenance: 'file' };
+    return { status: 'invalid', value: null, provenance: 'none' };
+  }
+  if (fileSurface) return { status: 'valid', value: fileSurface, provenance: 'file' };
+  if (fileInvalid) return { status: 'invalid', value: null, provenance: 'none' };
+  return { status: 'unset', value: null, provenance: 'none' };
 }
 
 /**

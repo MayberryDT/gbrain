@@ -130,7 +130,23 @@ const request_tools: Operation = {
     surface: {
       type: 'string',
       enum: ['verbs', 'starter', 'full'],
-      description: 'Persist this tool surface for your client. Must not exceed the server ceiling; ignored surfaces stay available via no-arg discovery. Takes effect on your next tools/list.',
+      description: 'Persist this tool surface for your client. Must not exceed the server ceiling. In compact presentation this does not enlarge the tool list.',
+    },
+    query: {
+      type: 'string',
+      description: 'Compact presentation only: search visible operations by name, area, or description. Ignored on the legacy catalog.',
+    },
+    limit: {
+      type: 'number',
+      description: 'Compact presentation only: page size, default 6, maximum 10.',
+    },
+    area: {
+      type: 'string',
+      description: 'Compact presentation only: restrict a search to one area name.',
+    },
+    cursor: {
+      type: 'string',
+      description: 'Compact presentation only: continuation token from the previous search page.',
     },
   },
   scope: 'read',
@@ -144,6 +160,33 @@ const request_tools: Operation = {
     // Unset ceiling (local CLI / direct dispatch) = 'full' — trusted-local
     // callers were never surface-bounded.
     const ceiling = ctx.surfaceCeiling ?? 'full';
+
+    if (ctx.presentation === 'compact') {
+      // Dynamic: presentation.ts imports surface.ts, which imports the
+      // allowlist, which imports operations.ts, which spreads this module.
+      const { classifyCompactRequest, compactDiscoveryResponse } = await import('../../mcp/presentation.ts');
+      const { resolveStrictParamsMode } = await import('../../mcp/validate-params.ts');
+      const classified = classifyCompactRequest(p as Record<string, unknown>);
+      if (classified.mode === 'invalid') {
+        throw new OperationError('invalid_params', classified.message);
+      }
+      if (classified.mode !== 'surface') {
+        const visible = await visibleOpsForCaller(ctx, ceiling);
+        const strictParams = (await resolveStrictParamsMode(ctx.engine, ctx.config)) === 'reject';
+        return compactDiscoveryResponse({
+          kind: classified.mode,
+          visible,
+          effective: ctx.surfaceEffective ?? ceiling,
+          ceiling,
+          canSelfPersist: ctx.canSelfPersistSurface === true,
+          strictParams,
+          ...(classified.mode === 'search'
+            ? { query: classified.query, area: classified.area, limit: classified.limit, cursor: classified.cursor }
+            : {}),
+          ...(classified.mode === 'descriptors' ? { tools: classified.tools } : {}),
+        });
+      }
+    }
 
     // D5: the three branches are mutually exclusive. {surface, tools}
     // together is ambiguous (persist vs descriptor fetch) — reject loudly
@@ -240,7 +283,13 @@ const request_tools: Operation = {
         new: requested,
         via: 'request_tools',
       });
-      return { persisted: true, surface: requested, note: 're-issue tools/list to see the new catalog' };
+      return {
+        persisted: true,
+        surface: requested,
+        note: ctx.presentation === 'compact'
+          ? 'Surface updated. Presentation stays compact; the next request resolves the new surface. Do not reload the advanced catalog.'
+          : 're-issue tools/list to see the new catalog',
+      };
     }
 
     const visible = await visibleOpsForCaller(ctx, ceiling);

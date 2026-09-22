@@ -49,6 +49,7 @@ import {
   isMcpSurface,
   resolveDefaultClientSurface,
 } from '../../mcp/surface.ts';
+import { resolvePresentation } from '../../mcp/presentation.ts';
 import {
   loadNagState,
   saveNagState,
@@ -145,10 +146,16 @@ export const collectMcpClientFit: AdvisorCollector = {
       const fits: ClientOpUsage[] = [];
       for (const u of real30) {
         if (u.total_calls < MIN_CALLS_FOR_FIT) continue;
-        if (!surfaces.has(u.token_name)) continue; // legacy bearer token — no per-client surface row to rescope
+        if (!surfaces.has(u.token_name)) continue;
         const resolved = clientResolvedSurface(surfaces.get(u.token_name), defaultSurface);
-        if (resolved !== 'full') continue; // already narrowed (row or DCR default)
+        if (resolved !== 'full') continue;
         if (!u.distinct_ops.every((op) => STARTER_OPS.has(op))) continue;
+        const presented = await resolvePresentation({
+          engine: ctx.engine,
+          config: ctx.config,
+          clientId: u.token_name,
+        });
+        if (presented.value === 'compact') continue;
         fits.push(u);
       }
       if (fits.length > 0) {

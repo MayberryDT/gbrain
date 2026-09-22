@@ -224,6 +224,9 @@ export interface DispatchOpts {
    * treated as 'full'.
    */
   surfaceCeiling?: 'verbs' | 'starter' | 'full';
+  presentation?: 'legacy' | 'compact';
+  surfaceEffective?: 'verbs' | 'starter' | 'full';
+  canSelfPersistSurface?: boolean;
 }
 
 /**
@@ -482,6 +485,9 @@ export function buildOperationContext(
     ...(sessionId ? { sessionId } : {}),
     ...(opts.localFederatedSourceIds ? { localFederatedSourceIds: opts.localFederatedSourceIds } : {}),
     ...(opts.surfaceCeiling ? { surfaceCeiling: opts.surfaceCeiling } : {}),
+    ...(opts.presentation ? { presentation: opts.presentation } : {}),
+    ...(opts.surfaceEffective ? { surfaceEffective: opts.surfaceEffective } : {}),
+    ...(opts.canSelfPersistSurface ? { canSelfPersistSurface: true } : {}),
     auth: opts.auth,
   };
 }

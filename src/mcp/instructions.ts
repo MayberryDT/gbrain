@@ -9,6 +9,7 @@
 import type { GBrainConfig } from '../core/config.ts';
 import { buildAmbientWritebackSection } from '../core/facts/writeback-instructions.ts';
 import type { AmbientWritebackOpts } from '../core/facts/writeback-instructions.ts';
+import { compactInstructions } from './presentation.ts';
 
 export const GBRAIN_MCP_INSTRUCTIONS = `GBrain agent operating contract (apply on every cold start):
 1. Treat gbrain as the user's persistent knowledge brain. Search or query it before external lookup, and use get_page when canonical page content matters.
@@ -48,18 +49,15 @@ type Env = Record<string, string | undefined>;
 export function resolveMcpInstructions(
   config: Pick<GBrainConfig, 'mcp'> | null | undefined,
   env: Env = process.env,
-  opts?: { writeback?: AmbientWritebackOpts | null },
+  opts?: { writeback?: AmbientWritebackOpts | null; presentation?: 'legacy' | 'compact' },
 ): string {
-  // Base = the canonical contract plus the opt-in ambient-writeback section
-  // (buildMcpInstructions); the deployment identity is appended LAST so the
-  // contract and the writeback instructions stay byte-identical to what the
-  // writeback tests pin whenever no identity is configured.
-  const base = buildMcpInstructions(opts);
-  // An empty / whitespace-only env value is UNSET, not an override: with `??`
-  // an exported-but-blank GBRAIN_MCP_INSTRUCTIONS='' shadowed a configured
-  // mcp.instructions and silently blanked the deployment identity.
   const fromEnv = env.GBRAIN_MCP_INSTRUCTIONS?.trim();
   const deploymentIdentity = fromEnv || config?.mcp?.instructions?.trim();
+  if (opts?.presentation === 'compact') {
+    const writeback = opts.writeback ? buildAmbientWritebackSection(opts.writeback) : null;
+    return compactInstructions({ writeback, identity: deploymentIdentity || null });
+  }
+  const base = buildMcpInstructions(opts);
   if (!deploymentIdentity) return base;
   return `${base}\n\nDeployment identity:\n${deploymentIdentity}`;
 }

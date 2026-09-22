@@ -4,10 +4,11 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import type { BrainEngine } from '../core/engine.ts';
 import { operations } from '../core/operations.ts';
 import { VERSION } from '../version.ts';
-import { buildToolDefs } from './tool-defs.ts';
 import { dispatchToolCall, buildOperationContext } from './dispatch.ts';
 import { validateParams, parseStrictParamsMode } from './validate-params.ts';
 import { filterOpsForSurface, allowedOpNames, clampSurface, type McpSurface } from './surface.ts';
+import { resolvePresentation, projectAdvertisedTools, compactAdvertisedNames, callerMayUseOperation } from './presentation.ts';
+import { planCompactCall, buildExecutePolicy, facadeError } from './execute-tool.ts';
 import { disabledOpsForPublishGates } from './publish-gates.ts';
 import type { Operation } from '../core/operations.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
@@ -187,32 +188,20 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   const surface: McpSurface = clampSurface(opts.surface ?? 'full');
   const surfacedOps = filterOpsForSurface(operations, surface);
   const allowedOps = surface === 'full' ? undefined : allowedOpNames(operations, surface);
+  const presentationResolution = await resolvePresentation({ engine, config });
+  const presentation = presentationResolution.value;
 
-  // Ambient writeback (opt-in, default off): resolved ONCE at boot — a
-  // config flip needs a serve restart on this lane, the same posture as
-  // `mcp.strict_params` below. Uses the fail-closed dual-plane resolver
-  // rather than a file-only read (deliberate deviation from the file-plane
-  // boot rule): the visibility POSTURE lives in the DB plane, and a partial
-  // file-only resolve could embed a `world` posture against an explicitly
-  // private brain. Read failure here yields the OFF bundle — no section,
-  // never a wrong posture — and the engine is already connected by the time
-  // serve reaches this call.
   const writeback = await resolveWritebackConfig(engine, config);
   const server = new Server(
     { name: 'gbrain', version: VERSION },
-    // listChanged: a client that handshakes during DEGRADED mode receives the
-    // gate-hidden catalog (stdioVisibleTools fail-closes every publishGateKey
-    // op on engine failure) and caches it — recovery sends the notification
-    // so the full catalog comes back without a harness restart.
     {
       capabilities: { tools: { listChanged: true } },
-      // #4748: canonical contract (+ opt-in ambient-writeback section) plus the
-      // optional operator-set deployment identity, appended last.
       instructions: resolveMcpInstructions(config, process.env, {
         writeback: ambientOptsFrom(writeback, {
           remember: allowedOps ? allowedOps.has('remember') : true,
-          extractFacts: allowedOps ? allowedOps.has('extract_facts') : true,
+          extractFacts: presentation === 'compact' ? false : (allowedOps ? allowedOps.has('extract_facts') : true),
         }),
+        presentation,
       }),
     },
   );
@@ -230,7 +219,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // `gbrain config set mcp.publish_skills true` takes effect on the next
   // tools/list without a serve restart (matches the HTTP transports).
   server.setRequestHandler(ListToolsRequestSchema, async () => trackStdioRpc(async () => ({
-    tools: buildToolDefs(await stdioVisibleTools(engine, surfacedOps), { strictParams }),
+    tools: projectAdvertisedTools(await stdioVisibleTools(engine, surfacedOps), { presentation, surface, strictParams }),
   })));
 
   // #4583 (fixes #4564's misrouted-write symptom): once-per-process advisory
@@ -274,11 +263,41 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       sourceScope.tier,
       operations.find(o => o.name === name)?.mutating === true,
     );
-    return dispatchToolCall(engine, name, params, {
+    let callName = name as string;
+    let callParams = params as Record<string, unknown> | undefined;
+    if (presentation === 'compact') {
+      const gateDisabled = await disabledOpsForPublishGates(engine, config);
+      const eligible = (op: Operation) => callerMayUseOperation(op, {
+        scopes: null,
+        gateDisabled,
+        transport: 'stdio',
+        remote: true,
+      });
+      const policy = buildExecutePolicy({
+        operations,
+        surface,
+        ceiling: surface,
+        eligible,
+        canSelfPersist: false,
+        strictParams,
+      });
+      const advertised = new Set(compactAdvertisedNames({ surface, eligibleOps: operations.filter(eligible) }));
+      const plan = planCompactCall({
+        presentation,
+        requestedName: callName,
+        requestedParams: callParams,
+        advertised,
+        policy,
+      });
+      if (plan.action === 'result') return plan.result;
+      if (plan.action === 'deny') return facadeError('operation_unavailable', 'That operation is not available.');
+      if (plan.action === 'forward') {
+        callName = plan.name;
+        callParams = plan.params;
+      }
+    }
+    return dispatchToolCall(engine, callName, callParams, {
       remote: true,
-      // #1061: mark the transport so whoami can report {transport: 'stdio'}
-      // instead of throwing unknown_transport. Trust posture unchanged —
-      // stdio stays remote/untrusted.
       transport: 'stdio',
       takesHoldersAllowList: ['world'],
       ...(sessionId ? { sessionId } : {}),
@@ -286,20 +305,13 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       ...(sourceScope.localFederatedSourceIds
         ? { localFederatedSourceIds: sourceScope.localFederatedSourceIds }
         : {}),
-      // --source-guard (plugin lanes): thread the winning resolution tier so
-      // dispatch can fail-close ambient-tier writes. Off (undefined) unless
-      // the serve was started with the flag.
       ...(opts.sourceGuard ? { sourceGuardTier: sourceScope.tier } : {}),
-      // v0.31 (eD3): _meta.brain_hot_memory injection so Claude Desktop /
-      // Code see the brain's relevant hot memory automatically alongside
-      // every tool-call response. Best-effort; absorbs errors.
       metaHook: getBrainHotMemoryMeta,
-      // MEMORY_VERBS v1: fail-closed surface enforcement + usage attribution.
       ...(allowedOps ? { allowedOps } : {}),
       surface,
-      // WP4 (D2): stdio has no per-client rows; its surface is the ceiling
-      // request_tools bounds its catalog by (persist no-ops without auth).
       surfaceCeiling: surface,
+      presentation,
+      surfaceEffective: surface,
     });
   }));
 

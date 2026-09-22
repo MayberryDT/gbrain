@@ -45,15 +45,16 @@ import { normalizeTokenScopes } from '../core/legacy-token-scope.ts';
 import { normalizeSourceInput, normalizeFederatedReadInput } from '../core/source-id.ts';
 import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult } from '../mcp/dispatch.ts';
 import { resolveStrictParamsMode } from '../mcp/validate-params.ts';
-import { buildToolDefs } from '../mcp/tool-defs.ts';
 import {
   filterOpsForSurface,
   clampSurface,
   minSurface,
   resolveClientRowSurface,
-  resolveDefaultClientSurface,
+  resolveDefaultClientSurfaceDetailed,
   type McpSurface,
 } from '../mcp/surface.ts';
+import { resolvePresentation, projectAdvertisedTools, compactAdvertisedNames, callerMayUseOperation } from '../mcp/presentation.ts';
+import { planCompactCall, buildExecutePolicy } from '../mcp/execute-tool.ts';
 import { writeSurfaceChangeAudit } from '../core/surface-audit.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { bindResolveIpcForServe } from '../mcp/resolve-ipc-binding.ts';
@@ -2296,20 +2297,30 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
    * the ceiling is the only floor available (pre-WP4 behavior).
    */
   let lastKnownDefaultSurface: McpSurface | null = null;
-  async function resolveEffectiveSurface(authInfo: AuthInfo): Promise<{ ceiling: McpSurface; effective: McpSurface }> {
+  async function resolveEffectiveSurface(authInfo: AuthInfo): Promise<{ ceiling: McpSurface; effective: McpSurface; degraded: boolean }> {
     const ceiling = clampSurface(serverSurfaceCeiling);
-    // min() can never go below the narrowest surface: a 'verbs' ceiling makes
-    // the row/default resolution a no-op, so skip the awaited config read.
-    if (ceiling === 'verbs') return { ceiling, effective: ceiling };
+    if (ceiling === 'verbs') return { ceiling, effective: ceiling, degraded: false };
     const rowSurface = resolveClientRowSurface(authInfo.surface, authInfo.clientId);
-    if (rowSurface !== null) return { ceiling, effective: minSurface(ceiling, rowSurface) };
-    try {
-      const dflt = await resolveDefaultClientSurface(engine, config);
-      lastKnownDefaultSurface = dflt ?? null;
-      return { ceiling, effective: minSurface(ceiling, dflt ?? ceiling) };
-    } catch {
-      return { ceiling, effective: minSurface(ceiling, lastKnownDefaultSurface ?? ceiling) };
+    if (rowSurface !== null) return { ceiling, effective: minSurface(ceiling, rowSurface), degraded: false };
+    const resolved = await resolveDefaultClientSurfaceDetailed(engine, config);
+    if (resolved.status === 'valid' && resolved.value) {
+      lastKnownDefaultSurface = resolved.value;
+      return { ceiling, effective: minSurface(ceiling, resolved.value), degraded: false };
     }
+    if (resolved.status === 'unset') {
+      return { ceiling, effective: ceiling, degraded: false };
+    }
+    if (resolved.value) {
+      lastKnownDefaultSurface = resolved.value;
+      console.error(`[surface] default surface ${resolved.status}; using ${resolved.provenance} fallback ${resolved.value}`);
+      return { ceiling, effective: minSurface(ceiling, resolved.value), degraded: true };
+    }
+    if (lastKnownDefaultSurface) {
+      console.error(`[surface] default surface ${resolved.status}; using last validated default ${lastKnownDefaultSurface}`);
+      return { ceiling, effective: minSurface(ceiling, lastKnownDefaultSurface), degraded: true };
+    }
+    console.error(`[surface] default surface ${resolved.status} with no fallback; degrading to verbs rather than the ceiling`);
+    return { ceiling, effective: 'verbs', degraded: true };
   }
 
   // v0.36.x #1076: MCP Streamable HTTP spec — GET /mcp opens an optional SSE
@@ -2351,34 +2362,34 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     // can call it (surface + scope + bound-client fence — the same
     // predicates tools/list applies).
     const canWrite = hasScope(authInfo.scopes, 'write');
-    const [{ ceiling: surfaceCeiling, effective: surface }, writeback] = await Promise.all([
+    const [{ ceiling: surfaceCeiling, effective: surface }, writeback, presentationResolution] = await Promise.all([
       resolveEffectiveSurface(authInfo),
       canWrite ? resolveWritebackConfig(engine, config) : Promise.resolve(null),
+      resolvePresentation({ engine, config, clientId: authInfo.clientId }),
     ]);
+    const presentation = presentationResolution.value;
     const mcpOperations = filterOpsForSurface(mcpOperationsBase, surface);
     const surfaceAllowedOps: ReadonlySet<string> | undefined =
       surface === 'full' ? undefined : new Set(mcpOperations.map(o => o.name));
+    const canSelfPersistSurface = Boolean(authInfo.clientId) && authInfo.surfaceSetBy !== 'operator';
 
-    // Create a fresh MCP server per request (stateless).
     let writebackOpts: ReturnType<typeof ambientOptsFrom> = null;
     if (writeback) {
-      // Both availability probes apply the SAME predicates tools/list does
-      // (surface filter + bound-client fence): a slug-bound client whose
-      // fence denies `remember` receives NO ambient section at all —
-      // instructions must never order calls dispatch will deny.
       const rememberOp = mcpOperations.find(o => o.name === 'remember');
       const extractFactsOp = mcpOperations.find(o => o.name === 'extract_facts');
+      const extractFactsDirect = presentation !== 'compact'
+        && extractFactsOp !== undefined
+        && opAllowedForBoundClient(authInfo, extractFactsOp);
       writebackOpts = ambientOptsFrom(writeback, {
         remember: rememberOp !== undefined && opAllowedForBoundClient(authInfo, rememberOp),
-        extractFacts: extractFactsOp !== undefined && opAllowedForBoundClient(authInfo, extractFactsOp),
+        extractFacts: extractFactsDirect,
       });
     }
     const server = new Server(
-      { name: 'gbrain', version: VERSION },
+      { name: 'gbrain', title: 'Chartroom', version: VERSION },
       {
         capabilities: { tools: {} },
-        // #4748: contract (+ opt-in writeback section) + deployment identity.
-        instructions: resolveMcpInstructions(config, process.env, { writeback: writebackOpts }),
+        instructions: resolveMcpInstructions(config, process.env, { writeback: writebackOpts, presentation }),
       },
     );
     server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -2416,14 +2427,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // 'reject' closes each schema with additionalProperties:false and
       // declares the _meta/dry_run passthrough keys (D14.1).
       const strictParams = strictParamsMode === 'reject';
-      const tools = buildToolDefs(visibleOps, { strictParams });
-      // v0.28.10: log every JSON-RPC method, not just successful tools/call.
-      // Pre-fix, /admin/api/requests showed nothing for clients that only
-      // ever called tools/list, and the v0.26.3 persistence regression test
-      // asserting >= 2 rows after tools/list + tools/call was unreachable.
-      // Amendment 23 stopgap (full list-size telemetry deferred): the row's
-      // params carry the listed-tool count so per-token-class list sizes are
-      // queryable (`params->>'tool_count'`) without new telemetry plumbing.
+      const tools = projectAdvertisedTools(visibleOps, { presentation, surface, strictParams });
       const latency = Date.now() - startTime;
       try {
         await executeRawJsonb(
@@ -2431,7 +2435,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
            VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
           [authInfo.clientId, agentName, 'tools/list', latency, 'success'],
-          [{ tool_count: tools.length }],
+          [{ tool_count: tools.length, presentation, surface }],
         );
       } catch { /* best effort */ }
       broadcastEvent({
@@ -2446,8 +2450,49 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     });
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: params } = request.params;
-      const op = mcpOperations.find(o => o.name === name);
+      let { name, arguments: params } = request.params;
+      let viaExecuteTool = false;
+      let compactDenied = false;
+      if (presentation === 'compact') {
+        const [gateDisabled, strictParamsMode] = await Promise.all([
+          disabledOpsForPublishGates(engine, config),
+          resolveStrictParamsMode(engine, config),
+        ]);
+        const eligible = (op: (typeof mcpOperationsBase)[number]) => callerMayUseOperation(op, {
+          scopes: authInfo.scopes.length > 0 ? authInfo.scopes : null,
+          auth: authInfo,
+          gateDisabled,
+          transport: 'http',
+          remote: true,
+        });
+        const policy = buildExecutePolicy({
+          operations: mcpOperationsBase,
+          surface,
+          ceiling: surfaceCeiling,
+          eligible,
+          canSelfPersist: canSelfPersistSurface,
+          strictParams: strictParamsMode === 'reject',
+        });
+        const advertised = new Set(compactAdvertisedNames({
+          surface,
+          eligibleOps: mcpOperationsBase.filter(eligible),
+        }));
+        const plan = planCompactCall({
+          presentation,
+          requestedName: name,
+          requestedParams: params,
+          advertised,
+          policy,
+        });
+        if (plan.action === 'result') return plan.result;
+        if (plan.action === 'deny') compactDenied = true;
+        if (plan.action === 'forward') {
+          name = plan.name;
+          params = plan.params;
+          viaExecuteTool = true;
+        }
+      }
+      const op = compactDenied ? undefined : mcpOperations.find(o => o.name === name);
       if (!op) {
         // v0.28.10: persist unknown-op attempts. Operators investigating
         // misbehaving agents need to see the full attempt log, not just
@@ -2540,9 +2585,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // 'tools/list'. Pre-existing string-shaped rows are normalized by
       // migration v41 in src/core/migrate.ts.
       const safeParamsSummary = summarizeMcpParams(name, params);
+      const viaMeta = viaExecuteTool ? { via: 'execute_tool' } : {};
       const logParamsObj: unknown = logFullParams
-        ? (params || null)
-        : (safeParamsSummary || null);
+        ? { ...(params && typeof params === 'object' ? params : {}), ...viaMeta }
+        : { ...(safeParamsSummary ?? {}), ...viaMeta };
       const broadcastParams = logFullParams ? (params || {}) : safeParamsSummary;
 
       // v0.31 (D12 / eE1): refactor the inlined op.handler call to go through
@@ -2599,6 +2645,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           surface,
           // WP4 (D2): request_tools bounds its catalog + persist by this.
           surfaceCeiling,
+          presentation,
+          surfaceEffective: surface,
+          ...(canSelfPersistSurface ? { canSelfPersistSurface: true } : {}),
           // v0.31 follow-up fix: thread auth so the whoami op (and any
           // future scope-aware handlers) can introspect the caller. The
           // original D12/eE1 refactor moved dispatch into dispatchToolCall

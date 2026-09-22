@@ -304,6 +304,15 @@ export interface OperationContext {
    */
   surfaceCeiling?: 'verbs' | 'starter' | 'full';
   /**
+   * Compact presentation is a listing choice, not a permission. Unset means
+   * the legacy catalog. Transports set this from operator config.
+   */
+  presentation?: 'legacy' | 'compact';
+  /** Effective surface for this request, distinct from the server ceiling. */
+  surfaceEffective?: 'verbs' | 'starter' | 'full';
+  /** True only when this caller may persist a wider surface themselves. */
+  canSelfPersistSurface?: boolean;
+  /**
    * Subagent runtime context (v0.16+). Set by the subagent tool dispatcher when
    * dispatching an op as a tool call from an LLM loop. Used to enforce per-op
    * agent policy (e.g. put_page namespace rule).
